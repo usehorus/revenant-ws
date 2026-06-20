@@ -1,0 +1,17 @@
+{
+  "name": "revenant-ws",
+  "version": "1.0.0",
+  "description": "Plain Node.js `ws` port of the Revenant PartyKit co-op game server. One global in-memory room, server-authoritative enemies, RAW-WebSocket wire protocol identical to the original.",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8"
+  },
+  "license": "MIT"
+}

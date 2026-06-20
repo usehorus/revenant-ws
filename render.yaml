@@ -1,0 +1,13 @@
+# Render Blueprint — one web service that runs the plain Node `ws` server.
+# Render injects PORT into the environment; server.js reads Number(process.env.PORT).
+# WebSocket upgrades work over the same HTTPS/WSS port on Render's free tier.
+services:
+  - type: web
+    name: revenant-ws
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    # server.js exposes GET / -> "revenant-ws ok" as an app-level liveness signal.
+    healthCheckPath: /
