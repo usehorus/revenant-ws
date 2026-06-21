@@ -572,7 +572,7 @@ seedEnemies();
 const server = http.createServer((req, res) => {
   // Plain health-check / liveness endpoint for Render & uptime pingers.
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("revenant-ws ok\n");
+  res.end("revenant-ws ok build=sep-v3\n");
 });
 
 // Accept upgrades on ANY path (client uses /parties/main/global, but stay
