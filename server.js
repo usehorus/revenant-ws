@@ -63,6 +63,22 @@ const RESPAWN_DELAY_MS = 25000;
 const MAX_HIT_DMG = 1000;
 
 /**
+ * Boids-style SEPARATION tuning. Without it, enemies all path to the same point
+ * (the nearest player) and stop at stopDist from the PLAYER, never avoiding each
+ * OTHER — so they pile into an overlapping blob. Each tick we push every alive,
+ * moving enemy away from its alive neighbors so they settle into a ring ~3-5
+ * units apart instead of stacking.
+ *
+ * SEPARATION_RADIUS — only neighbors closer than this (horizontal) contribute.
+ * SEPARATION_PUSH   — scales the accumulated push into a per-tick step.
+ * SEPARATION_MAX_STEP — hard clamp on the per-tick separation step so enemies
+ *                       glide apart instead of jittering/teleporting.
+ */
+const SEPARATION_RADIUS = 6;
+const SEPARATION_PUSH = 0.5;
+const SEPARATION_MAX_STEP = 0.6;
+
+/**
  * The FIXED roster, seeded once. ids/types/coords are matched by the client to
  * its local meshes — DO NOT rename or reorder-sensitive fields.
  */
@@ -378,6 +394,82 @@ function updateEnemies() {
       }
     }
   }
+
+  // --- SEPARATION (boids) ---
+  // After all chase/return movement, de-overlap alive, MOVING enemies so a
+  // cluster around a player spreads into a ring instead of a blob. Runs
+  // regardless of aggro; skulls (moves:false) never translate. O(n^2) over <=19
+  // enemies = ~361 checks/tick at 15Hz — cheap; keep the simple double loop.
+  for (const e of enemies.values()) {
+    if (!e.alive) continue;
+    const tuneE = ENEMY_TUNING[e.type];
+    if (!tuneE || !tuneE.moves) continue; // skip skulls / non-movers
+
+    let pushX = 0;
+    let pushZ = 0;
+
+    for (const o of enemies.values()) {
+      if (o === e || !o.alive) continue;
+
+      let dx = e.x - o.x;
+      let dz = e.z - o.z;
+      let d = Math.sqrt(dx * dx + dz * dz);
+
+      if (d >= SEPARATION_RADIUS) continue; // out of range — no contribution
+
+      if (d > 1e-6) {
+        // Normalized away-from-neighbor direction, weighted by closeness
+        // (1 at touching, 0 at the radius edge).
+        const w = 1 - d / SEPARATION_RADIUS;
+        pushX += (dx / d) * w;
+        pushZ += (dz / d) * w;
+      } else {
+        // Coincident (d ~= 0): a normalize would be NaN. Use a tiny
+        // deterministic offset from id-string hashes so the pair still splits
+        // the same way every tick (no random jitter, no NaN).
+        const he = hashId(e.id);
+        const ho = hashId(o.id);
+        const ang = ((he - ho) % 360) * (Math.PI / 180);
+        pushX += Math.cos(ang) * 0.5;
+        pushZ += Math.sin(ang) * 0.5;
+      }
+    }
+
+    if (pushX !== 0 || pushZ !== 0) {
+      let stepX = pushX * SEPARATION_PUSH;
+      let stepZ = pushZ * SEPARATION_PUSH;
+
+      // Clamp the per-tick separation step length so enemies don't jitter or
+      // teleport when many neighbors stack their pushes.
+      const stepLen = Math.sqrt(stepX * stepX + stepZ * stepZ);
+      if (stepLen > SEPARATION_MAX_STEP && stepLen > 0) {
+        const k = SEPARATION_MAX_STEP / stepLen;
+        stepX *= k;
+        stepZ *= k;
+      }
+
+      // Final NaN/Infinity guard — never let a bad step poison the snapshot.
+      if (isFiniteNumber(stepX) && isFiniteNumber(stepZ)) {
+        e.x += stepX;
+        e.z += stepZ;
+        // y left as-is: handled by the chase/return pass above.
+      }
+    }
+  }
+}
+
+/**
+ * Tiny deterministic hash of an enemy id -> non-negative integer. Used only to
+ * derive a stable split direction for exactly-coincident enemies so they never
+ * NaN and always separate the same way.
+ */
+function hashId(id) {
+  let h = 0;
+  const s = String(id);
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return h < 0 ? -h : h;
 }
 
 // -----------------------------------------------------------------------------
