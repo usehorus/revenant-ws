@@ -63,20 +63,22 @@ const RESPAWN_DELAY_MS = 25000;
 const MAX_HIT_DMG = 1000;
 
 /**
- * Boids-style SEPARATION tuning. Without it, enemies all path to the same point
- * (the nearest player) and stop at stopDist from the PLAYER, never avoiding each
- * OTHER — so they pile into an overlapping blob. Each tick we push every alive,
- * moving enemy away from its alive neighbors so they settle into a ring ~3-5
- * units apart instead of stacking.
+ * HARD positional separation (de-overlap) tuning. The old velocity-based push
+ * lost to the chase: every tick chase pulled all enemies back to the same stop
+ * point and the weak push couldn't overcome it, so ~5 enemies clustered on a
+ * player piled to ~0.5 units apart (overlapping). Instead we now run an
+ * iterative positional solver AFTER chase/return each tick that DIRECTLY pushes
+ * overlapping pairs apart on x/z. Because it runs after movement and mutates
+ * positions (not velocities), the chase cannot undo it within the same tick, so
+ * a cluster resolves into a clean ring ~MIN_SPACING apart within a couple ticks.
  *
- * SEPARATION_RADIUS — only neighbors closer than this (horizontal) contribute.
- * SEPARATION_PUSH   — scales the accumulated push into a per-tick step.
- * SEPARATION_MAX_STEP — hard clamp on the per-tick separation step so enemies
- *                       glide apart instead of jittering/teleporting.
+ * MIN_SPACING       — desired minimum horizontal distance between any two alive
+ *                     enemies. Pairs closer than this get pushed apart.
+ * SEPARATION_PASSES — relaxation passes per tick (a simple iterative solver);
+ *                     more passes converge a tight pile faster.
  */
-const SEPARATION_RADIUS = 6;
-const SEPARATION_PUSH = 0.5;
-const SEPARATION_MAX_STEP = 0.6;
+const MIN_SPACING = 3.0;
+const SEPARATION_PASSES = 2;
 
 /**
  * The FIXED roster, seeded once. ids/types/coords are matched by the client to
@@ -395,64 +397,88 @@ function updateEnemies() {
     }
   }
 
-  // --- SEPARATION (boids) ---
-  // After all chase/return movement, de-overlap alive, MOVING enemies so a
-  // cluster around a player spreads into a ring instead of a blob. Runs
-  // regardless of aggro; skulls (moves:false) never translate. O(n^2) over <=19
-  // enemies = ~361 checks/tick at 15Hz — cheap; keep the simple double loop.
+  // --- HARD POSITIONAL SEPARATION (de-overlap) ---
+  // Runs AFTER all chase/return movement, BEFORE broadcast. An iterative
+  // relaxation solver: each pass walks every unordered pair of ALIVE enemies and,
+  // if they are closer than MIN_SPACING, slides them directly apart on x/z. This
+  // mutates POSITIONS (not velocities), so the chase cannot undo it within the
+  // same tick — a tight pile resolves into a clean ring within a couple ticks.
+  //
+  // Movers split the overlap 50/50; a non-mover (skull, moves:false) is treated
+  // as immovable, so its mover partner takes the FULL correction and slides
+  // around it. Two non-movers are skipped (their spawns are far apart anyway).
+  //
+  // Snapshot the alive roster once; O(n^2) over <=19 enemies ~= 171 pairs/pass,
+  // 2 passes at 15Hz — trivially cheap.
+  const alive = [];
   for (const e of enemies.values()) {
-    if (!e.alive) continue;
-    const tuneE = ENEMY_TUNING[e.type];
-    if (!tuneE || !tuneE.moves) continue; // skip skulls / non-movers
+    if (e.alive) alive.push(e);
+  }
 
-    let pushX = 0;
-    let pushZ = 0;
+  for (let pass = 0; pass < SEPARATION_PASSES; pass++) {
+    for (let i = 0; i < alive.length; i++) {
+      const a = alive[i];
+      const tuneA = ENEMY_TUNING[a.type];
+      const aMoves = !!(tuneA && tuneA.moves);
 
-    for (const o of enemies.values()) {
-      if (o === e || !o.alive) continue;
+      for (let j = i + 1; j < alive.length; j++) {
+        const b = alive[j];
+        const tuneB = ENEMY_TUNING[b.type];
+        const bMoves = !!(tuneB && tuneB.moves);
 
-      let dx = e.x - o.x;
-      let dz = e.z - o.z;
-      let d = Math.sqrt(dx * dx + dz * dz);
+        // Two immovable enemies (e.g. two skulls) — nothing to do.
+        if (!aMoves && !bMoves) continue;
 
-      if (d >= SEPARATION_RADIUS) continue; // out of range — no contribution
+        const dx = a.x - b.x;
+        const dz = a.z - b.z;
+        const d = Math.sqrt(dx * dx + dz * dz);
 
-      if (d > 1e-6) {
-        // Normalized away-from-neighbor direction, weighted by closeness
-        // (1 at touching, 0 at the radius edge).
-        const w = 1 - d / SEPARATION_RADIUS;
-        pushX += (dx / d) * w;
-        pushZ += (dz / d) * w;
-      } else {
-        // Coincident (d ~= 0): a normalize would be NaN. Use a tiny
-        // deterministic offset from id-string hashes so the pair still splits
-        // the same way every tick (no random jitter, no NaN).
-        const he = hashId(e.id);
-        const ho = hashId(o.id);
-        const ang = ((he - ho) % 360) * (Math.PI / 180);
-        pushX += Math.cos(ang) * 0.5;
-        pushZ += Math.sin(ang) * 0.5;
-      }
-    }
+        if (d >= MIN_SPACING) continue; // already spaced — skip
 
-    if (pushX !== 0 || pushZ !== 0) {
-      let stepX = pushX * SEPARATION_PUSH;
-      let stepZ = pushZ * SEPARATION_PUSH;
+        const overlap = MIN_SPACING - d;
 
-      // Clamp the per-tick separation step length so enemies don't jitter or
-      // teleport when many neighbors stack their pushes.
-      const stepLen = Math.sqrt(stepX * stepX + stepZ * stepZ);
-      if (stepLen > SEPARATION_MAX_STEP && stepLen > 0) {
-        const k = SEPARATION_MAX_STEP / stepLen;
-        stepX *= k;
-        stepZ *= k;
-      }
+        // Unit direction A<-B. Coincident pair (d ~= 0) would NaN a normalize,
+        // so derive a stable per-pair angle from the id hashes (deterministic,
+        // no randomness, always the same split).
+        let nx;
+        let nz;
+        if (d > 1e-4) {
+          nx = dx / d;
+          nz = dz / d;
+        } else {
+          const ang = ((hashId(a.id) - hashId(b.id)) % 360) * (Math.PI / 180);
+          nx = Math.cos(ang);
+          nz = Math.sin(ang);
+        }
 
-      // Final NaN/Infinity guard — never let a bad step poison the snapshot.
-      if (isFiniteNumber(stepX) && isFiniteNumber(stepZ)) {
-        e.x += stepX;
-        e.z += stepZ;
-        // y left as-is: handled by the chase/return pass above.
+        // Distribute the correction: movers share it 50/50; if one is immovable
+        // the mover absorbs the FULL overlap and slides around it.
+        let aShare;
+        let bShare;
+        if (aMoves && bMoves) {
+          aShare = overlap * 0.5;
+          bShare = overlap * 0.5;
+        } else if (aMoves) {
+          aShare = overlap;
+          bShare = 0;
+        } else {
+          aShare = 0;
+          bShare = overlap;
+        }
+
+        // Apply on x/z only; never touch y. Guard every write against NaN/Inf.
+        if (aShare !== 0) {
+          const ax = a.x + nx * aShare;
+          const az = a.z + nz * aShare;
+          if (isFiniteNumber(ax)) a.x = ax;
+          if (isFiniteNumber(az)) a.z = az;
+        }
+        if (bShare !== 0) {
+          const bx = b.x - nx * bShare;
+          const bz = b.z - nz * bShare;
+          if (isFiniteNumber(bx)) b.x = bx;
+          if (isFiniteNumber(bz)) b.z = bz;
+        }
       }
     }
   }
