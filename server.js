@@ -43,12 +43,17 @@ const STATE_INTERVAL_MS = Math.round(1000 / STATE_HZ); // ~67ms (Math.round(66.6
 // Enemy roster + AI tuning (mirrors src/server.ts)
 // -----------------------------------------------------------------------------
 
-/** Per-type AI tuning. skull never moves; y handling differs per type. */
+/**
+ * Per-type AI tuning. skull never moves; y handling differs per type.
+ * `aggro` = max horizontal distance at which an enemy will chase a player
+ * (mirrors the original single-player game's move() distance checks). Outside
+ * aggro the enemy drifts back to its spawn anchor instead of clustering.
+ */
 const ENEMY_TUNING = {
-  skull: { stopDist: 4, speed: 0, flies: false, moves: false },
-  zombie: { stopDist: 4, speed: 0.12, flies: false, moves: true },
-  skeleton: { stopDist: 4, speed: 0.24, flies: false, moves: true },
-  dragon: { stopDist: 4, speed: 0.4, flies: true, moves: true },
+  skull: { stopDist: 4, speed: 0, flies: false, moves: false, aggro: 0 },
+  zombie: { stopDist: 4, speed: 0.12, flies: false, moves: true, aggro: 40 },
+  skeleton: { stopDist: 4, speed: 0.24, flies: false, moves: true, aggro: 25 },
+  dragon: { stopDist: 4, speed: 0.4, flies: true, moves: true, aggro: 40 },
 };
 
 /** Seconds (ms) a dead enemy stays down before respawning at its anchor. */
@@ -318,33 +323,59 @@ function updateEnemies() {
     }
 
     // --- AI ---
-    const target = nearestPlayer(e);
-    if (!target) continue; // no connected players -> idle
-
-    const dx = target.x - e.x;
-    const dz = target.z - e.z;
-    const d = Math.sqrt(dx * dx + dz * dz);
-
-    // Face the nearest player every tick (even stationary skulls face).
-    e.yaw = Math.atan2(dx, dz);
-
     const tune = ENEMY_TUNING[e.type];
+    const target = nearestPlayer(e);
 
-    // Flyers track the player's height (clamped); grounded types stay put.
-    if (tune.flies) {
+    // Always face the nearest player when there is one (even idle enemies face).
+    let d = Infinity;
+    if (target) {
+      const dx = target.x - e.x;
+      const dz = target.z - e.z;
+      d = Math.sqrt(dx * dx + dz * dz);
+      e.yaw = Math.atan2(dx, dz);
+    }
+
+    // Chase only when this enemy moves AND the nearest player is within aggro.
+    const inAggro = target !== null && d <= tune.aggro;
+
+    // Flyers track the player's height (clamped) ONLY while in aggro; otherwise
+    // they let y return toward spawnY along with the horizontal drift below.
+    if (tune.flies && inAggro && target) {
       e.y = clamp(target.y, 0, 6);
     }
 
-    if (!tune.moves) continue; // skulls never translate
+    if (!tune.moves) continue; // skulls never translate (either direction)
 
-    // Move only when beyond stopDist, and never overshoot it.
-    if (d > tune.stopDist) {
-      const step = Math.min(tune.speed, d - tune.stopDist);
-      // d > stopDist >= 0 so d > 0 -> safe to normalize.
-      const nx = dx / d;
-      const nz = dz / d;
-      e.x += nx * step;
-      e.z += nz * step;
+    if (inAggro && target) {
+      // CHASE: move toward the player at full speed, never overshoot stopDist.
+      const dx = target.x - e.x;
+      const dz = target.z - e.z;
+      if (d > tune.stopDist) {
+        const step = Math.min(tune.speed, d - tune.stopDist);
+        // d > stopDist >= 0 so d > 0 -> safe to normalize.
+        const nx = dx / d;
+        const nz = dz / d;
+        e.x += nx * step;
+        e.z += nz * step;
+      }
+    } else {
+      // RETURN: no target (or out of aggro) -> drift back to spawn anchor at
+      // HALF speed (x/y/z), snapping + idling once within ~1 unit. Keeps
+      // enemies spread across their map sections instead of clustering.
+      const sx = e.spawnX - e.x;
+      const sy = e.spawnY - e.y;
+      const sz = e.spawnZ - e.z;
+      const ds = Math.sqrt(sx * sx + sy * sy + sz * sz);
+      if (ds <= 1) {
+        e.x = e.spawnX;
+        e.y = e.spawnY;
+        e.z = e.spawnZ;
+      } else {
+        const step = Math.min(tune.speed * 0.5, ds);
+        e.x += (sx / ds) * step;
+        e.y += (sy / ds) * step;
+        e.z += (sz / ds) * step;
+      }
     }
   }
 }
