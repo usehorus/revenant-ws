@@ -7,12 +7,17 @@
  *
  * Wire protocol (must match client net.js + server types.ts):
  *   Client -> server:
- *     { t:"input", v:1, x, y, z, yaw, weapon }
+ *     { t:"input", v:1, x, y, z, yaw, weapon[, title, nameColor, glow] }
  *     { t:"hit",   v:1, id, dmg }
  *   Server -> client:
  *     { t:"welcome", v:1, id }
- *     { t:"state",   v:1, players:[{id,x,y,z,yaw,name,weapon}],
+ *     { t:"state",   v:1, players:[{id,x,y,z,yaw,name,weapon,title,nameColor,glow}],
  *                         enemies:[{id,type,x,y,z,yaw,hp,maxHp,alive}] }
+ *
+ *   title/nameColor/glow are OPTIONAL equipped-nametag cosmetics: title is a
+ *   short printable string (<=24 chars), nameColor a "#rrggbb" hex (or null),
+ *   glow a bool. They are validated/clamped server-side and always present in
+ *   the state broadcast (default "" / null / false) so remote.js can render.
  *     { t:"join",    v:1, id, name }
  *     { t:"leave",   v:1, id }
  *     { t:"full",    v:1 }
@@ -64,6 +69,12 @@ const MAX_HIT_DMG = 1000;
 
 /** Highest valid weapon index a client may select. */
 const MAX_WEAPON_INDEX = 7;
+
+/** Max length of a cosmetic title broadcast to other players. */
+const MAX_TITLE_LEN = 24;
+
+/** A "#rrggbb" hex color, exactly 6 hex digits. */
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 /**
  * HARD positional separation (de-overlap) tuning. The old velocity-based push
@@ -126,6 +137,28 @@ function clamp(n, lo, hi) {
 /** Round to 2 decimals to keep the state payload small. */
 function round2(n) {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * Sanitize a client-supplied cosmetic title into a short printable string.
+ * Strips control chars (anti-injection), collapses to printable, caps length.
+ * Returns "" for anything non-string / empty so the field is always a string.
+ */
+function sanitizeTitle(v) {
+  if (typeof v !== "string") return "";
+  // Drop ASCII control chars (0x00-0x1F and 0x7F DEL) so a hostile client can't
+  // inject newlines/markup, then trim and cap length. Flat printable label only.
+  // eslint-disable-next-line no-control-regex
+  const cleaned = v.replace(/[\x00-\x1F\x7F]/g, "").trim();
+  return cleaned.slice(0, MAX_TITLE_LEN);
+}
+
+/**
+ * Validate a client-supplied name color. Returns a "#rrggbb" string when it
+ * matches the strict hex pattern, else null (no fallback color forced).
+ */
+function sanitizeNameColor(v) {
+  return typeof v === "string" && HEX_COLOR_RE.test(v) ? v : null;
 }
 
 /** Cheap unique id fallback when no wallet is supplied. */
@@ -254,7 +287,7 @@ function broadcastExcept(exceptWs, msg) {
 
 /** Validate + apply an "input" message onto the player's pose. */
 function applyInput(player, msg) {
-  const { x, y, z, yaw, weapon } = msg;
+  const { x, y, z, yaw, weapon, title, nameColor, glow } = msg;
 
   // Reject anything non-finite — keeps NaN/Infinity out of the snapshot.
   if (
@@ -279,6 +312,19 @@ function applyInput(player, msg) {
   // weapon is optional/loose — coerce to a small bounded non-negative integer.
   if (isFiniteNumber(weapon)) {
     player.weapon = clamp(Math.floor(weapon), 0, MAX_WEAPON_INDEX);
+  }
+
+  // OPTIONAL equipped-nametag cosmetics. Only touch a field when the client
+  // actually sent it (key present) so an input frame that omits cosmetics never
+  // wipes the player's previously-equipped look. All values are sanitized.
+  if ("title" in msg) {
+    player.title = sanitizeTitle(title); // "" if non-string/empty, <=24 printable
+  }
+  if ("nameColor" in msg) {
+    player.nameColor = sanitizeNameColor(nameColor); // "#rrggbb" or null
+  }
+  if ("glow" in msg) {
+    player.glow = !!glow; // coerce to a strict bool
   }
 }
 
@@ -541,6 +587,11 @@ function tick() {
         yaw: round2(p.yaw),
         name: p.name,
         weapon: p.weapon,
+        // Equipped-nametag cosmetics — always present so remote.js can render
+        // (defaults: "" title, null color, false glow set at connect time).
+        title: p.title,
+        nameColor: p.nameColor,
+        glow: p.glow,
       });
     }
 
@@ -603,7 +654,7 @@ seedEnemies();
 const server = http.createServer((req, res) => {
   // Plain health-check / liveness endpoint for Render & uptime pingers.
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("revenant-ws ok build=bugfix1\n");
+  res.end("revenant-ws ok build=shop1\n");
 });
 
 // Accept upgrades on ANY path (client uses /parties/main/global, but stay
@@ -658,6 +709,11 @@ wss.on("connection", (ws, req) => {
       yaw: 0,
       name: name,
       weapon: 0,
+      // Equipped-nametag cosmetics, defaulted until the client sends them on an
+      // "input" frame. Kept in the snapshot so other players always see a value.
+      title: "",
+      nameColor: null,
+      glow: false,
     };
     players.set(connId, player);
 
