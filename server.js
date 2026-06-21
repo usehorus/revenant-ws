@@ -62,6 +62,9 @@ const RESPAWN_DELAY_MS = 25000;
 /** Max damage a single "hit" message may apply. */
 const MAX_HIT_DMG = 1000;
 
+/** Highest valid weapon index a client may select. */
+const MAX_WEAPON_INDEX = 7;
+
 /**
  * HARD positional separation (de-overlap) tuning. The old velocity-based push
  * lost to the chase: every tick chase pulled all enemies back to the same stop
@@ -269,11 +272,13 @@ function applyInput(player, msg) {
   player.x = clamp(x, -BOUND, BOUND);
   player.y = clamp(y, -BOUND, BOUND);
   player.z = clamp(z, -BOUND, BOUND);
-  player.yaw = yaw;
+  // Wrap yaw into [-PI, PI] so a hostile client can't push a huge magnitude
+  // (e.g. 1e308) into the snapshot.
+  player.yaw = yaw - 2 * Math.PI * Math.round(yaw / (2 * Math.PI));
 
-  // weapon is optional/loose — coerce to a small non-negative integer.
+  // weapon is optional/loose — coerce to a small bounded non-negative integer.
   if (isFiniteNumber(weapon)) {
-    player.weapon = Math.max(0, Math.floor(weapon));
+    player.weapon = clamp(Math.floor(weapon), 0, MAX_WEAPON_INDEX);
   }
 }
 
@@ -533,7 +538,7 @@ function tick() {
         x: p.x,
         y: p.y,
         z: p.z,
-        yaw: p.yaw,
+        yaw: round2(p.yaw),
         name: p.name,
         weapon: p.weapon,
       });
@@ -598,7 +603,7 @@ seedEnemies();
 const server = http.createServer((req, res) => {
   // Plain health-check / liveness endpoint for Render & uptime pingers.
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("revenant-ws ok build=sep-v3\n");
+  res.end("revenant-ws ok build=bugfix1\n");
 });
 
 // Accept upgrades on ANY path (client uses /parties/main/global, but stay
